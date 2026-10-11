@@ -15,11 +15,22 @@
  *   FLICK LEFT on release .  delete   (card flies left and fades)
  *   RELEASE OVER TODAY BIN  keep for today (card flies into the bin)
  *   RELEASE elsewhere .....  card lerps back to its arc slot
+ *   PINCH the EXIT card ...  leave the immersive session (world.exitXR()).
+ *                          The Quest system fallback is palm-toward-you +
+ *                          pinch-and-hold to open the universal menu, then Quit.
  *
  * Flick detection: per-hand velocity is tracked every frame from the
  * grip-space world position (works for hands and controllers). On release,
  * the releasing hand's smoothed velocity classifies the gesture. Thresholds
  * are deliberately conservative — a drop is never a delete.
+ *
+ * Player anchoring: fixed world coordinates are unreliable — the XR
+ * reference space is not guaranteed to line up with where the user is
+ * standing/facing when the session starts. So the whole layout (card arc,
+ * TODAY bin, hint, EXIT card) anchors to the head pose: once on the first
+ * frame (covers the flat/emulator preview) and again a few frames after an
+ * XR session starts (covers entering VR from the 2D page). The HUD was
+ * already head-following and is untouched.
  *
  * NOTE (hand tuning): these numbers were picked blind, without a headset
  * session. Expect to tune FLICK_SPEED_MPS, BIN_RADIUS_M, and the arc layout
@@ -50,10 +61,15 @@ import {
 
 // ---------------------------------------------------------------------------
 // TUNING — adjust on-device.
+//
+// The layout is anchored to the player: distances are meters in front of the
+// head, heights are offsets from head height. anchorToPlayer() snapshots the
+// head pose (position + yaw) on the first frame and re-snapshots a few frames
+// after an XR session starts, so the arc is always in front of the player.
 // ---------------------------------------------------------------------------
 const SLOT_COUNT: number = 5;
-const SLOT_Y = 1.32;
-const SLOT_Z = -0.9;
+const SLOT_DIST = 0.9; // arc distance in front of the player (m)
+const SLOT_Y_OFF = -0.28; // below head height (m)
 const SLOT_SPREAD = 0.6; // half-width of the arc in meters
 const CARD_W = 0.36;
 const CARD_H = 0.24;
@@ -64,14 +80,26 @@ const HELD_SCALE = 1.3;
 const FLICK_SPEED_MPS = 1.0;
 /** Flick must be this much stronger on X than on Y/Z to count. */
 const FLICK_AXIS_DOMINANCE = 1.5;
+/** TODAY bin, mirrored EXIT card: (sideways-m, y-offset-m, distance-m). */
+const BIN_X = 0.68;
+const BIN_Y_OFF = -0.3;
+const BIN_DIST = 0.7;
 /** Release within this radius (m) of the bin center = keep for today. */
 const BIN_RADIUS_M = 0.3;
-const BIN_POS = new Vector3(0.68, 1.02, -0.7);
+const EXIT_X = -0.68;
+const EXIT_Y_OFF = -0.3;
+const EXIT_DIST = 0.7;
+const HINT_Y_OFF = -0.68;
+const HINT_DIST = 0.95;
+const ZERO_Y_OFF = -0.15;
+const ZERO_DIST = 1.3;
 /** Exit-animation fly speed (m/s) and fade duration (s). */
 const DISMISS_SPEED = 2.4;
 const DISMISS_DURATION = 0.55;
 /** How fast a dropped card glides home (lerp factor per second). */
 const RETURN_LERP = 7;
+/** Frames to wait after XR session start before re-anchoring (pose settle). */
+const ANCHOR_SETTLE_FRAMES = 6;
 
 interface CardRuntime {
   mesh: Mesh;
@@ -97,6 +125,14 @@ export class TriageSystem extends createSystem({
   private tmpQ = new Quaternion();
   private fwd = new Vector3();
   private headPos = new Vector3();
+  private up = new Vector3(0, 1, 0);
+
+  // --- player anchor (position + yaw snapshot) ---
+  private anchorPos = new Vector3();
+  private anchorYawQ = new Quaternion();
+  private anchored = false;
+  private hadSession = false;
+  private settleFrames = 0;
 
   // --- per-hand velocity tracking ---
   private handPrevL = new Vector3();
@@ -113,6 +149,13 @@ export class TriageSystem extends createSystem({
   /** Slot occupancy: slot index -> entity (or null). */
   private slots: (Entity | null)[] = [];
   private remaining = 0;
+
+  // --- world-anchored props ---
+  private binMesh!: Mesh;
+  private binLabel!: Mesh;
+  private binPos = new Vector3();
+  private exitMesh!: Mesh;
+  private exitEntity: Entity | null = null;
 
   // --- HUD / overlays ---
   private hudCanvas!: HTMLCanvasElement;
@@ -140,26 +183,101 @@ export class TriageSystem extends createSystem({
     this.buildHud();
     this.buildHint();
     this.buildZeroOverlay();
+    this.buildExit();
 
-    // Deal the opening hand.
+    // Deal the opening hand (positioned on first anchor).
     for (let s = 0; s < SLOT_COUNT; s++) this.dealIntoSlot(s);
     this.drawHud();
 
-    this.queries.grabbed.subscribe('qualify', (e) => this.onGrab(e));
+    this.queries.grabbed.subscribe('qualify', (e) => {
+      if (e === this.exitEntity) {
+        // Pinch the EXIT card → leave the immersive session, back to the page.
+        this.world.exitXR();
+        return;
+      }
+      this.onGrab(e);
+    });
     this.queries.grabbed.subscribe('disqualify', (e) => this.onRelease(e));
     this.cleanupFuncs.push(() => {
       this.runtime = new WeakMap();
     });
   }
 
-  // ------------------------------------------------------------------ setup
+  // ------------------------------------------------------- player anchoring
 
-  private slotPosition(slot: number, out: Vector3): Vector3 {
+  /**
+   * Snapshot the head pose (position + yaw) and lay out the world-anchored
+   * content in front of the player. Called on the first frame and again
+   * shortly after an XR session starts, so the arc is always where the
+   * player is actually looking — never stranded at fixed world coordinates
+   * the reference space doesn't line up with.
+   */
+  private anchorToPlayer(): void {
+    this.player.head.getWorldPosition(this.headPos);
+    this.player.head.getWorldQuaternion(this.tmpQ);
+    // Yaw only: flatten the head's forward so looking up/down doesn't tilt
+    // the whole layout.
+    this.fwd.set(0, 0, -1).applyQuaternion(this.tmpQ);
+    this.fwd.y = 0;
+    if (this.fwd.lengthSq() < 1e-6) this.fwd.set(0, 0, -1);
+    this.fwd.normalize();
+    this.anchorYawQ.setFromAxisAngle(
+      this.up,
+      Math.atan2(-this.fwd.x, -this.fwd.z),
+    );
+    this.anchorPos.copy(this.headPos);
+
+    for (let s = 0; s < SLOT_COUNT; s++) {
+      const e = this.slots[s];
+      if (e) this.placeCardInSlot(e, s);
+    }
+
+    this.placeLocal(this.binMesh, BIN_X, BIN_Y_OFF, BIN_DIST, false);
+    this.binPos.copy(this.binMesh.position);
+    this.placeLocal(this.binLabel, BIN_X, BIN_Y_OFF + 0.32, BIN_DIST, true);
+    this.placeLocal(this.hintMesh, 0, HINT_Y_OFF, HINT_DIST, true);
+    this.placeLocal(this.zeroMesh, 0, ZERO_Y_OFF, ZERO_DIST, true);
+    this.placeLocal(this.exitMesh, EXIT_X, EXIT_Y_OFF, EXIT_DIST, true);
+
+    this.anchored = true;
+  }
+
+  /** Place a mesh at (x, yOff, dist) in the anchor frame, facing the player. */
+  private placeLocal(
+    mesh: Mesh,
+    x: number,
+    yOff: number,
+    dist: number,
+    facePlayer: boolean,
+  ): void {
+    this.tmpC.set(x, 0, -dist).applyQuaternion(this.anchorYawQ);
+    this.tmpC.add(this.anchorPos);
+    this.tmpC.y = this.anchorPos.y + yOff;
+    mesh.position.copy(this.tmpC);
+    if (facePlayer) {
+      mesh.lookAt(this.anchorPos.x, this.tmpC.y, this.anchorPos.z);
+    }
+  }
+
+  private placeCardInSlot(entity: Entity, slot: number): void {
+    const rt = this.runtime.get(entity);
+    if (!rt) return;
     const t = SLOT_COUNT === 1 ? 0 : slot / (SLOT_COUNT - 1); // 0..1
     const x = (t - 0.5) * 2 * SLOT_SPREAD;
-    const z = SLOT_Z - 0.15 * Math.pow(x / SLOT_SPREAD, 2); // gentle arc
-    return out.set(x, SLOT_Y, z);
+    const dist = SLOT_DIST + 0.15 * Math.pow(x / SLOT_SPREAD, 2); // gentle arc
+    this.tmpB.set(x, 0, -dist).applyQuaternion(this.anchorYawQ);
+    this.tmpB.add(this.anchorPos);
+    this.tmpB.y = this.anchorPos.y + SLOT_Y_OFF;
+    rt.mesh.position.copy(this.tmpB);
+    // Face the player (plane +Z toward the head).
+    rt.mesh.lookAt(this.anchorPos.x, this.tmpB.y, this.anchorPos.z);
+    const home = entity.getVectorView(EmailCard, 'homePosition');
+    home[0] = this.tmpB.x;
+    home[1] = this.tmpB.y;
+    home[2] = this.tmpB.z;
   }
+
+  // ------------------------------------------------------------------ setup
 
   private dealIntoSlot(slot: number): void {
     const emailIndex = this.queue.shift();
@@ -175,14 +293,7 @@ export class TriageSystem extends createSystem({
       slotIndex: slot,
     });
     entity.addComponent(OneHandGrabbable, { rotate: false });
-    const home = entity.getVectorView(EmailCard, 'homePosition');
-    this.slotPosition(slot, this.tmpA);
-    home[0] = this.tmpA.x;
-    home[1] = this.tmpA.y;
-    home[2] = this.tmpA.z;
-    mesh.position.copy(this.tmpA);
-    // Face the player (plane +Z toward origin).
-    mesh.lookAt(0, this.tmpA.y, 0);
+    if (this.anchored) this.placeCardInSlot(entity, slot);
 
     this.runtime.set(entity, {
       mesh,
@@ -198,7 +309,7 @@ export class TriageSystem extends createSystem({
   }
 
   private buildBin(): void {
-    const bin = new Mesh(
+    this.binMesh = new Mesh(
       new BoxGeometry(0.3, 0.3, 0.3),
       new MeshBasicMaterial({
         color: 0x2fbf71,
@@ -206,14 +317,22 @@ export class TriageSystem extends createSystem({
         opacity: 0.22,
       }),
     );
-    bin.position.copy(BIN_POS);
-    this.world.createTransformEntity(bin);
-    const label = makeLabelPlane('TODAY', 0.34, {
+    this.world.createTransformEntity(this.binMesh);
+    this.binLabel = makeLabelPlane('TODAY', 0.34, {
       color: '#7dffb0',
       sub: 'drop here to keep',
     });
-    label.position.set(BIN_POS.x, BIN_POS.y + 0.32, BIN_POS.z);
-    this.world.createTransformEntity(label);
+    this.world.createTransformEntity(this.binLabel);
+  }
+
+  private buildExit(): void {
+    this.exitMesh = makeLabelPlane('EXIT', 0.36, {
+      fontPx: 96,
+      color: '#ff8080',
+      sub: 'pinch to leave',
+    });
+    this.exitEntity = this.world.createTransformEntity(this.exitMesh);
+    this.exitEntity.addComponent(OneHandGrabbable, { rotate: false });
   }
 
   private buildHud(): void {
@@ -250,7 +369,6 @@ export class TriageSystem extends createSystem({
       color: '#cfe0ff',
       sub: 'flick → archive · ← flick delete · drop in TODAY to keep',
     });
-    this.hintMesh.position.set(0, 0.92, -0.95);
     this.world.createTransformEntity(this.hintMesh);
   }
 
@@ -260,7 +378,6 @@ export class TriageSystem extends createSystem({
       color: '#7dffb0',
       sub: 'nice work — see you tomorrow',
     });
-    this.zeroMesh.position.set(0, 1.45, -1.3);
     this.zeroMesh.visible = false;
     this.world.createTransformEntity(this.zeroMesh);
   }
@@ -305,9 +422,9 @@ export class TriageSystem extends createSystem({
       rt.dismissVel.set(dir * DISMISS_SPEED, 0.7, -0.4);
       this.beginDismiss(entity, rt);
       this.hideHint();
-    } else if (this.tmpA.distanceTo(BIN_POS) < BIN_RADIUS_M) {
+    } else if (this.tmpA.distanceTo(this.binPos) < BIN_RADIUS_M) {
       // --- BIN: released over TODAY → keep for today ---
-      rt.dismissVel.copy(this.tmpB.copy(BIN_POS).sub(this.tmpA).normalize());
+      rt.dismissVel.copy(this.tmpB.copy(this.binPos).sub(this.tmpA).normalize());
       this.beginDismiss(entity, rt);
       this.hideHint();
     } else {
@@ -370,6 +487,21 @@ export class TriageSystem extends createSystem({
 
   update(delta: number): void {
     if (delta <= 0) return;
+
+    // 0. Anchor the layout to the player: once on the first frame, and again
+    //    shortly after an XR session starts (head pose needs a few frames
+    //    to settle once the session is live).
+    const hasSession = this.world.xrSession != null;
+    if (!this.anchored) {
+      this.anchorToPlayer();
+    } else if (hasSession && !this.hadSession) {
+      this.settleFrames = ANCHOR_SETTLE_FRAMES;
+    }
+    if (this.settleFrames > 0) {
+      this.settleFrames -= 1;
+      if (this.settleFrames === 0) this.anchorToPlayer();
+    }
+    this.hadSession = hasSession;
 
     // 1. Hand velocity, both hands, every frame (needed at release time).
     this.trackHand('left', delta);

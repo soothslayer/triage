@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 2,
+  "sessionId": "19e8aa4c-8f50-4fd7-b33d-5e8b9974aa68",
+  "workspaceRoot": "/home/hatch/workspace/triage",
+  "pid": 5322,
+  "processStart": "29a948d0-9e00-4bdd-90d4-b7746e1fcbeb:229997",
+  "port": 8081,
+  "localUrl": "https://localhost:8081/",
+  "networkUrls": [
+    "https://198.19.0.2:8081/"
+  ],
+  "browser": {
+    "lifecycle": {
+      "state": "failed",
+      "policy": "eager",
+      "sessionId": "19e8aa4c-8f50-4fd7-b33d-5e8b9974aa68",
+      "browserEpoch": 1,
+      "revision": 2,
+      "stateEnteredAt": "2026-10-11T14:03:01.459Z",
+      "lastObservedAt": "2026-10-11T14:03:01.459Z",
+      "failures": 1,
+      "cleanupConfirmed": true,
+      "attemptLimit": 3,
+      "historyTruncated": false,
+      "retryEligible": true,
+      "nextAction": "A managed-target command or runtime_recover can launch the browser.",
+      "history": [
+        {
+          "revision": 1,
+          "state": "launching",
+          "at": "2026-10-11T13:57:53.626Z",
+          "reason": "launch"
+        },
+        {
+          "revision": 2,
+          "state": "failed",
+          "at": "2026-10-11T14:03:01.459Z",
+          "reason": "Chromium installation failed (exit code 1). Run the installed Playwright CLI with \"install chromium\", then use runtime_recover."
+        }
+      ],
+      "attemptId": "e94d33e8-3963-4b96-bcc1-75a6cd1ce13c",
+      "issue": "Chromium installation failed (exit code 1). Run the installed Playwright CLI with \"install chromium\", then use runtime_recover.",
+      "issueAt": "2026-10-11T14:03:01.459Z",
+      "issueCause": "browser_launch_failed"
+    },
+    "status": "launch_failed",
+    "clients": [],
+    "connected": false,
+    "commandReady": false,
+    "connectedClientCount": 0,
+    "lastTransitionAt": "2026-10-11T14:03:01.459Z",
+    "lastError": {
+      "cause": "browser_launch_failed",
+      "message": "Chromium installation failed (exit code 1). Run the installed Playwright CLI with \"install chromium\", then use runtime_recover.",
+      "at": "2026-10-11T14:03:01.459Z"
+    }
+  },
+  "browserAutomation": {
+    "configured": false,
+    "enabled": false,
+    "protocol": "cdp"
+  },
+  "registeredAt": "2026-10-11T13:57:53.600Z",
+  "updatedAt": "2026-10-11T14:03:01.467Z"
+}
