@@ -21,7 +21,9 @@
  *
  * Flick detection: per-hand velocity is tracked every frame from the
  * grip-space world position (works for hands and controllers). On release,
- * the releasing hand's smoothed velocity classifies the gesture. Thresholds
+ * the releasing hand's smoothed velocity is rotated into the player-anchored
+ * frame (whose +X is the player's right) before classifying the gesture —
+ * raw world X is only "right" when the player faces world -Z. Thresholds
  * are deliberately conservative — a drop is never a delete.
  *
  * Player anchoring: fixed world coordinates are unreliable — the XR
@@ -407,19 +409,29 @@ export class TriageSystem extends createSystem({
 
     const hand = rt.lastHand;
     const vel = hand === 'left' ? this.handVelL : this.handVelR;
-    const ax = Math.abs(vel.x);
+    // Player-relative flick: the hand velocity is world-space, but "right"
+    // only equals world +X when the player faces world -Z — which is almost
+    // never true once the layout anchors to the head yaw. Rotate the velocity
+    // into the anchor frame (whose +X is the player's right) before
+    // classifying, or flicks map to arbitrary world directions.
+    this.tmpQ.copy(this.anchorYawQ).invert();
+    this.tmpB.copy(vel).applyQuaternion(this.tmpQ);
+    const ax = Math.abs(this.tmpB.x);
 
     entity.object3D?.getWorldPosition(this.tmpA);
 
     if (
       hand !== null &&
       ax > FLICK_SPEED_MPS &&
-      ax > FLICK_AXIS_DOMINANCE * Math.abs(vel.y) &&
-      ax > FLICK_AXIS_DOMINANCE * Math.abs(vel.z)
+      ax > FLICK_AXIS_DOMINANCE * Math.abs(this.tmpB.y) &&
+      ax > FLICK_AXIS_DOMINANCE * Math.abs(this.tmpB.z)
     ) {
       // --- FLICK: horizontal throw classifies the triage action ---
-      const dir = vel.x > 0 ? 1 : -1; // +x = right = archive
-      rt.dismissVel.set(dir * DISMISS_SPEED, 0.7, -0.4);
+      const dir = this.tmpB.x > 0 ? 1 : -1; // anchor +x = player's right = archive
+      // Dismiss along the player's right, transformed back to world space.
+      rt.dismissVel
+        .set(dir * DISMISS_SPEED, 0.7, -0.4)
+        .applyQuaternion(this.anchorYawQ);
       this.beginDismiss(entity, rt);
       this.hideHint();
     } else if (this.tmpA.distanceTo(this.binPos) < BIN_RADIUS_M) {
