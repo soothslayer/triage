@@ -13,6 +13,8 @@
  *                          expanded texture so you can read the full body.
  *   FLICK RIGHT on release  archive  (card flies right and fades)
  *   FLICK LEFT on release .  delete   (card flies left and fades)
+ *   FLICK UP on release ...  reply    (composer opens; dictate, send)
+ *   FLICK DOWN on release .  forward  (composer opens; dictate, send)
  *   RELEASE OVER TODAY BIN  keep for today (card flies into the bin)
  *   RELEASE elsewhere .....  card lerps back to its arc slot
  *   PINCH the EXIT card ...  leave the immersive session (world.exitXR()).
@@ -22,9 +24,10 @@
  * Flick detection: per-hand velocity is tracked every frame from the
  * grip-space world position (works for hands and controllers). On release,
  * the releasing hand's smoothed velocity is rotated into the player-anchored
- * frame (whose +X is the player's right) before classifying the gesture —
- * raw world X is only "right" when the player faces world -Z. Thresholds
- * are deliberately conservative — a drop is never a delete.
+ * frame (whose +X is the player's right, +Y is up) before classifying the
+ * gesture — raw world X is only "right" when the player faces world -Z.
+ * Vertical flicks (reply/forward) are checked before horizontal ones.
+ * Thresholds are deliberately conservative — a drop is never a delete.
  *
  * Player anchoring: fixed world coordinates are unreliable — the XR
  * reference space is not guaranteed to line up with where the user is
@@ -55,6 +58,7 @@ import {
 import type { Entity } from '@iwsdk/core';
 import { CardState, EmailCard } from './email-card.js';
 import { MOCK_INBOX } from './mockInbox.js';
+import { ImmersiveComposer } from './composer.js';
 import {
   makeCardTextures,
   makeLabelPlane,
@@ -82,6 +86,10 @@ const HELD_SCALE = 1.3;
 const FLICK_SPEED_MPS = 1.0;
 /** Flick must be this much stronger on X than on Y/Z to count. */
 const FLICK_AXIS_DOMINANCE = 1.5;
+/** Min vertical hand speed (m/s) to count as a reply/forward flick. */
+const FLICK_VERT_SPEED_MPS = 1.0;
+/** Vertical flick must dominate X/Z by this much. */
+const FLICK_VERT_DOMINANCE = 1.5;
 /** TODAY bin, mirrored EXIT card: (sideways-m, y-offset-m, distance-m). */
 const BIN_X = 0.68;
 const BIN_Y_OFF = -0.3;
@@ -169,6 +177,10 @@ export class TriageSystem extends createSystem({
   private zeroT = -1; // < 0 = hidden
   private hintHidden = false;
 
+  // --- immersive composer (reply / forward) ---
+  private composer: ImmersiveComposer | null = null;
+  private composingEntity: Entity | null = null;
+
   init(): void {
     // Pinch-to-grab: WITHOUT this, GrabSystem only honors the physical
     // squeeze button, so bare hands could never pick up a card.
@@ -186,6 +198,10 @@ export class TriageSystem extends createSystem({
     this.buildHint();
     this.buildZeroOverlay();
     this.buildExit();
+    this.composer = new ImmersiveComposer(this.world, {
+      onSend: (mode, email, body) => this.onComposeSend(mode, email, body),
+      onDiscard: () => this.onComposeDiscard(),
+    });
 
     // Deal the opening hand (positioned on first anchor).
     for (let s = 0; s < SLOT_COUNT; s++) this.dealIntoSlot(s);
@@ -197,6 +213,8 @@ export class TriageSystem extends createSystem({
         this.world.exitXR();
         return;
       }
+      // Composer buttons (Dictate/Send/Discard) press on pinch.
+      if (this.composer?.handlePinch(e)) return;
       this.onGrab(e);
     });
     this.queries.grabbed.subscribe('disqualify', (e) => this.onRelease(e));
@@ -369,7 +387,7 @@ export class TriageSystem extends createSystem({
     this.hintMesh = makeLabelPlane('Pinch a card to read it', 1.15, {
       fontPx: 56,
       color: '#cfe0ff',
-      sub: 'flick → archive · ← flick delete · drop in TODAY to keep',
+      sub: '→ archive · ← delete · ↑ reply · ↓ forward · TODAY to keep',
     });
     this.world.createTransformEntity(this.hintMesh);
   }
@@ -412,15 +430,26 @@ export class TriageSystem extends createSystem({
     // Player-relative flick: the hand velocity is world-space, but "right"
     // only equals world +X when the player faces world -Z — which is almost
     // never true once the layout anchors to the head yaw. Rotate the velocity
-    // into the anchor frame (whose +X is the player's right) before
+    // into the anchor frame (whose +X is the player's right, +Y is up) before
     // classifying, or flicks map to arbitrary world directions.
     this.tmpQ.copy(this.anchorYawQ).invert();
     this.tmpB.copy(vel).applyQuaternion(this.tmpQ);
     const ax = Math.abs(this.tmpB.x);
+    const ay = Math.abs(this.tmpB.y);
 
     entity.object3D?.getWorldPosition(this.tmpA);
 
     if (
+      hand !== null &&
+      ay > FLICK_VERT_SPEED_MPS &&
+      ay > FLICK_VERT_DOMINANCE * ax &&
+      ay > FLICK_VERT_DOMINANCE * Math.abs(this.tmpB.z)
+    ) {
+      // --- VERTICAL FLICK: up = reply, down = forward ---
+      const mode = this.tmpB.y > 0 ? 'reply' : 'forward';
+      this.openComposer(mode, entity, rt);
+      this.hideHint();
+    } else if (
       hand !== null &&
       ax > FLICK_SPEED_MPS &&
       ax > FLICK_AXIS_DOMINANCE * Math.abs(this.tmpB.y) &&
@@ -454,6 +483,61 @@ export class TriageSystem extends createSystem({
     entity.setValue(EmailCard, 'slotIndex', -1);
     this.remaining = Math.max(0, this.remaining - 1);
     this.drawHud();
+  }
+
+  // ------------------------------------------------------- reply / forward
+
+  private openComposer(
+    mode: 'reply' | 'forward',
+    entity: Entity,
+    rt: CardRuntime,
+  ): void {
+    const emailIndex = entity.getValue(EmailCard, 'emailIndex') ?? -1;
+    if (emailIndex < 0 || !this.composer) return;
+    const email = MOCK_INBOX[emailIndex];
+    // Park the card (hide it) while composing; it returns on discard.
+    rt.mesh.visible = false;
+    this.composingEntity = entity;
+    entity.setValue(EmailCard, 'state', CardState.Held); // suspend triage
+    this.composer.open(mode, email, this.anchorPos, this.anchorYawQ);
+  }
+
+  private onComposeSend(
+    mode: 'reply' | 'forward',
+    _email: unknown,
+    _body: string,
+  ): void {
+    // Mock send: the card is archived (reply) or stays (forward keeps a copy).
+    // Gmail wiring lands later; for now the gesture completes the loop.
+    const entity = this.composingEntity;
+    this.composingEntity = null;
+    if (entity) {
+      const rt = this.runtime.get(entity);
+      if (rt) {
+        rt.mesh.visible = true;
+        if (mode === 'reply') {
+          // Reply sent → archive the original.
+          rt.dismissVel.set(2.0, 0.7, -0.4).applyQuaternion(this.anchorYawQ);
+          this.beginDismiss(entity, rt);
+        } else {
+          // Forward sent → card glides back to its slot.
+          entity.setValue(EmailCard, 'state', CardState.Returning);
+        }
+      }
+    }
+    this.hideHint();
+  }
+
+  private onComposeDiscard(): void {
+    const entity = this.composingEntity;
+    this.composingEntity = null;
+    if (entity) {
+      const rt = this.runtime.get(entity);
+      if (rt) {
+        rt.mesh.visible = true;
+        entity.setValue(EmailCard, 'state', CardState.Returning);
+      }
+    }
   }
 
   private hideHint(): void {
