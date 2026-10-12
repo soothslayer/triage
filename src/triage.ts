@@ -17,7 +17,7 @@
  *   RELEASE elsewhere .....  card lerps back to its arc slot
  *   PINCH the EXIT card ...  leave the immersive session (world.exitXR()).
  *                          The Quest system fallback is palm-toward-you +
- *                          pinch-and-hold to open the universal menu, then Quit.
+ *                          pinch, wait for the icon to fill, then release.
  *
  * Flick detection: per-hand velocity is tracked every frame from the
  * grip-space world position (works for hands and controllers). On release,
@@ -49,6 +49,7 @@ import {
   OneHandGrabbable,
   PlaneGeometry,
   Quaternion,
+  RayInteractable,
   Vector3,
 } from '@iwsdk/core';
 import type { Entity } from '@iwsdk/core';
@@ -119,7 +120,7 @@ interface CardRuntime {
 
 export class TriageSystem extends createSystem({
   cards: { required: [EmailCard] },
-  grabbed: { required: [EmailCard, Grabbed] },
+  grabbed: { required: [Grabbed] },
 }) {
   // --- preallocated temps (never allocate in update()) ---
   private tmpA = new Vector3();
@@ -301,6 +302,9 @@ export class TriageSystem extends createSystem({
       slotIndex: slot,
     });
     entity.addComponent(OneHandGrabbable, { rotate: false });
+    entity.addComponent(RayInteractable);
+    // Keep one handle, accepting both near grabs and ray-selected pinches.
+    root.pointerEventsType = { allow: ['grab', 'ray'] };
     this.runtime.set(entity, {
       root,
       mesh,
@@ -337,10 +341,12 @@ export class TriageSystem extends createSystem({
     this.exitMesh = makeLabelPlane('EXIT', 0.36, {
       fontPx: 96,
       color: '#ff8080',
-      sub: 'pinch to leave',
+      sub: 'aim and pinch to leave',
     });
     this.exitEntity = this.world.createTransformEntity(this.exitMesh);
-    this.exitEntity.addComponent(OneHandGrabbable, { rotate: false });
+    this.exitEntity.addComponent(OneHandGrabbable, { rotate: false, translate: false });
+    this.exitEntity.addComponent(RayInteractable);
+    this.exitMesh.pointerEventsType = { allow: ['grab', 'ray'] };
   }
 
   private buildHud(): void {
@@ -372,7 +378,7 @@ export class TriageSystem extends createSystem({
   }
 
   private buildHint(): void {
-    this.hintMesh = makeLabelPlane('Pinch a card to read it', 1.15, {
+    this.hintMesh = makeLabelPlane('Touch or aim, then pinch', 1.15, {
       fontPx: 56,
       color: '#cfe0ff',
       sub: 'flick → archive · ← flick delete · drop in TODAY to keep',

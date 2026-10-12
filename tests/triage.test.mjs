@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
 import * as core from '@iwsdk/core';
+import { createGrabPointer, createRayPointer } from '@pmndrs/pointer-events';
 import { intersectPointerEventTargets } from '../node_modules/@pmndrs/pointer-events/dist/intersections/utils.js';
 
 // Run the application TypeScript in memory. Only canvas drawing and XR input
@@ -27,18 +28,22 @@ function loadModule(name) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
   });
   vm.runInNewContext(outputText, {
-    exports, document, console,
+    exports, document, console, performance,
     require: (id) => id === '@iwsdk/core' ? core : loadModule(id.replace('./', '')),
   }, { filename: fileURLToPath(new URL('../src/' + name, import.meta.url)) });
   return exports;
 }
 const { TriageSystem } = loadModule('triage.js');
+const { HandPinchSystem } = loadModule('hand-pinch.js');
 const { EmailCard, CardState } = loadModule('email-card.js');
 
 function setup() {
   const world = new core.World();
+  world.registerComponent(core.Hovered).registerComponent(core.Pressed);
   world.scene = new core.Scene();
   world.sceneEntity = world.createTransformEntity(world.scene);
+  world.camera = new core.PerspectiveCamera();
+  world.renderer = { xr: new core.EventDispatcher() };
   world.player = {
     head: new core.Object3D(),
     gripSpaces: { left: new core.Object3D(), right: new core.Object3D() },
@@ -46,13 +51,16 @@ function setup() {
   world.player.head.position.set(2, 1.6, 3);
   world.player.head.rotation.y = Math.PI / 3;
   const pointer = (id) => ({ toggleSubPointer() {}, getPointer: () => ({ id }) });
-  world.input = { xr: {
+  world.input = { update() {}, xr: {
     multiPointers: { left: pointer(1), right: pointer(2) },
     gazePointer: { pointer: { id: 3 }, getHeldByHand: () => null },
     isPrimary: () => false,
     gamepads: {},
+    getPrimaryInputSource: () => undefined,
   } };
-  world.registerSystem(core.GrabSystem);
+  world.registerSystem(core.InputSystem, { priority: -4, configData: { maintainScenePointers: true } });
+  world.registerSystem(HandPinchSystem, { priority: -3.5 });
+  world.registerSystem(core.GrabSystem, { priority: -3 });
   world.registerSystem(TriageSystem);
   world.update(1 / 60, 0);
   return { world, system: world.getSystem(TriageSystem) };
@@ -173,4 +181,102 @@ test('card lifecycle against IWSDK', async (t) => {
     assert.equal(disposed, 2);
     assert.equal(system.runtime.has(other), false);
   });
+  await t.test('native hands without a gamepad can pinch, drag and release', () => {
+    const source = { hand: {}, handedness: 'right', gamepad: null };
+    const session = new EventTarget();
+    world.session = session;
+    world.renderer.xr.dispatchEvent({ type: 'sessionstart' });
+    const card = system.slots[2];
+    const root = card.object3D;
+    const origin = new core.Object3D();
+    origin.position.copy(root.position);
+    const pointer = createGrabPointer(() => world.camera, { current: origin }, {});
+    const xr = world.input.xr;
+    const previousMulti = xr.multiPointers.right;
+    xr.isPrimary = (kind, hand) => kind === 'hand' && hand === 'right';
+    xr.getPrimaryInputSource = () => source;
+    xr.multiPointers.right = {
+      getActivePointer: () => pointer,
+      getPointer: () => pointer,
+      routeDown: (_, __, event) => pointer.down({ ...event, button: 2 }),
+      routeUp: (_, __, event) => pointer.up({ ...event, button: 2 }),
+    };
+    function select(type) {
+      const event = new Event(type);
+      Object.defineProperty(event, 'inputSource', { value: source });
+      session.dispatchEvent(event);
+    }
+    function frame() {
+      origin.updateMatrix();
+      pointer.move(world.scene, { timeStamp: performance.now() });
+      world.update(1 / 60, performance.now() / 1000);
+    }
+    frame();
+    assert.ok(!pointer.getIntersection().object.isVoidObject);
+    select('selectstart');
+    frame();
+    assert.equal(card.getValue(EmailCard, 'state'), CardState.Held);
+    assert.equal(system.runtime.get(card).lastHand, 'right');
+    const before = root.position.clone();
+    origin.position.x += 0.1;
+    frame();
+    assert.ok(root.position.x > before.x + 0.09);
+    select('selectend');
+    frame();
+    assert.equal(card.getValue(EmailCard, 'state'), CardState.Returning);
+
+    // Both native edges may arrive between rendered frames.
+    origin.position.copy(root.position);
+    frame();
+    select('selectstart');
+    select('selectend');
+    frame();
+    assert.equal(card.getValue(EmailCard, 'state'), CardState.Held);
+    frame();
+    assert.equal(card.getValue(EmailCard, 'state'), CardState.Returning);
+
+    let exits = 0;
+    world.exitXR = () => { exits++; };
+    origin.position.copy(system.exitMesh.position);
+    frame();
+    select('selectstart');
+    frame();
+    assert.equal(exits, 1, 'EXIT must be observed without an EmailCard component');
+    select('selectend');
+    frame();
+    world.session = undefined;
+    world.renderer.xr.dispatchEvent({ type: 'sessionend' });
+    xr.multiPointers.right = previousMulti;
+    xr.getPrimaryInputSource = () => undefined;
+    xr.isPrimary = () => false;
+  });
+
+  await t.test('ray pinches can grab cards and activate EXIT', () => {
+    const origin = new core.PerspectiveCamera();
+    origin.position.copy(system.anchorPos);
+    const pointer = createRayPointer(() => world.camera, { current: origin }, {});
+    const card = system.slots[3];
+    origin.lookAt(card.object3D.position);
+    origin.updateMatrix();
+    pointer.move(world.scene, { timeStamp: 1000 });
+    assert.ok(!pointer.getIntersection().object.isVoidObject);
+    pointer.down({ button: 0, timeStamp: 1010 });
+    world.update(1 / 60, 1.01);
+    assert.equal(card.getValue(EmailCard, 'state'), CardState.Held);
+    pointer.up({ button: 0, timeStamp: 1020 });
+    world.update(1 / 60, 1.02);
+    assert.equal(card.getValue(EmailCard, 'state'), CardState.Queued);
+
+    let exits = 0;
+    world.exitXR = () => { exits++; };
+    origin.lookAt(system.exitMesh.position);
+    origin.updateMatrix();
+    pointer.move(world.scene, { timeStamp: 1030 });
+    pointer.down({ button: 0, timeStamp: 1040 });
+    world.update(1 / 60, 1.04);
+    assert.equal(exits, 1);
+    pointer.up({ button: 0, timeStamp: 1050 });
+    world.update(1 / 60, 1.05);
+  });
+
 });

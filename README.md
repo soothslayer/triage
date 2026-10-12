@@ -1,7 +1,7 @@
 # Triage
 
 Spatial inbox-zero for the Meta VR Start contest (productivity track).
-Pinch email cards to read them, flick right to archive, flick left to delete,
+Touch or aim at email cards and pinch to read them, flick right to archive, flick left to delete,
 drop them in the TODAY bin to keep. Mock inbox for now; Gmail OAuth lands later.
 
 ## Stack
@@ -42,17 +42,20 @@ to line up with where the user stands/faces at session start — this was the
 
 ## Leaving the app
 
-- **In-app:** pinch the red EXIT card (left of the arc) — it calls
+- **In-app:** touch or aim at the red EXIT card (left of the arc), then pinch — it calls
   `world.exitXR()` and drops you back to the 2D page.
 - **System gesture (no controllers):** turn your palm toward you at eye
-  level, then pinch-and-hold thumb + index finger until the indicator fills —
-  the universal menu opens, then choose Quit.
+  level, pinch thumb + index finger until the indicator fills, then release.
+  See [Meta's WebXR hand guide](https://developers.meta.com/vr/documentation/web/webxr-hands/).
 
 ## How the gestures work
 
 - `useHandPinchForGrab = true` is set on the GrabSystem in `TriageSystem.init()`
   — without it, bare-hand pinch does nothing (only the squeeze button grabs).
-- Cards are `OneHandGrabbable` (proximity). `Grabbed` qualify → expand;
+- `HandPinchSystem` bridges native WebXR hand select events to near grabs
+  when no gamepad is present (a missing path in IWSDK 1.0.1).
+- Cards use one `OneHandGrabbable` handle with `RayInteractable` and an explicit
+  pointer filter accepting both grab and ray pointers. `Grabbed` qualify → expand;
   `disqualify` → classify the release.
 - Hand velocity is tracked per-frame from `player.gripSpaces` world positions
   with exponential smoothing. On release, a dominant horizontal velocity is a
