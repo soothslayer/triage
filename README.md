@@ -15,6 +15,7 @@ components in `src/email-card.ts`, game logic in `src/triage.ts`.
 ```sh
 npm run dev        # iwsdk-managed dev server (opens managed browser)
 npm run typecheck  # tsc --noEmit — run before testing, always
+npm test           # card lifecycle regressions against the installed SDK
 npm run build      # production build → dist/
 ```
 
@@ -25,6 +26,11 @@ All the feel numbers live in the TUNING block at the top of `src/triage.ts`
 tune on a real headset.
 
 ## Player anchoring
+
+Artificial locomotion is disabled in `iwsdk.config.json`. This is a stationary
+inbox with no collision floor; enabling locomotion makes the virtual player
+fall under gravity, so the cards and TODAY bin appear to rise out of view.
+Head and hand tracking still follow your real movements.
 
 The card arc, TODAY bin, hint, and EXIT card are laid out relative to the
 player's head pose, not fixed world coordinates: the layout snapshots head

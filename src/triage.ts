@@ -43,6 +43,7 @@ import {
   createSystem,
   Grabbed,
   GrabSystem,
+  Group,
   Mesh,
   MeshBasicMaterial,
   OneHandGrabbable,
@@ -102,6 +103,8 @@ const RETURN_LERP = 7;
 const ANCHOR_SETTLE_FRAMES = 6;
 
 interface CardRuntime {
+  /** GrabSystem owns this transform; visual expansion stays on its child. */
+  root: Group;
   mesh: Mesh;
   mat: MeshBasicMaterial;
   faceTex: CanvasTexture;
@@ -198,9 +201,12 @@ export class TriageSystem extends createSystem({
       this.onGrab(e);
     });
     this.queries.grabbed.subscribe('disqualify', (e) => this.onRelease(e));
-    this.cleanupFuncs.push(() => {
-      this.runtime = new WeakMap();
-    });
+    this.cleanupFuncs.push(
+      this.queries.cards.subscribe('disqualify', (e) => this.disposeCardTextures(e)),
+      () => {
+        for (const e of this.queries.cards.entities) this.disposeCardTextures(e);
+      },
+    );
   }
 
   // ------------------------------------------------------- player anchoring
@@ -268,9 +274,9 @@ export class TriageSystem extends createSystem({
     this.tmpB.set(x, 0, -dist).applyQuaternion(this.anchorYawQ);
     this.tmpB.add(this.anchorPos);
     this.tmpB.y = this.anchorPos.y + SLOT_Y_OFF;
-    rt.mesh.position.copy(this.tmpB);
+    rt.root.position.copy(this.tmpB);
     // Face the player (plane +Z toward the head).
-    rt.mesh.lookAt(this.anchorPos.x, this.tmpB.y, this.anchorPos.z);
+    rt.root.lookAt(this.anchorPos.x, this.tmpB.y, this.anchorPos.z);
     const home = entity.getVectorView(EmailCard, 'homePosition');
     home[0] = this.tmpB.x;
     home[1] = this.tmpB.y;
@@ -286,16 +292,17 @@ export class TriageSystem extends createSystem({
     const { face, expanded } = makeCardTextures(email);
     const mat = new MeshBasicMaterial({ map: face, transparent: true });
     const mesh = new Mesh(new PlaneGeometry(CARD_W, CARD_H), mat);
-    const entity = this.world.createTransformEntity(mesh);
+    const root = new Group();
+    root.add(mesh);
+    const entity = this.world.createTransformEntity(root);
     entity.addComponent(EmailCard, {
       emailIndex,
       state: CardState.Queued,
       slotIndex: slot,
     });
     entity.addComponent(OneHandGrabbable, { rotate: false });
-    if (this.anchored) this.placeCardInSlot(entity, slot);
-
     this.runtime.set(entity, {
+      root,
       mesh,
       mat,
       faceTex: face,
@@ -306,6 +313,7 @@ export class TriageSystem extends createSystem({
       dismissSlot: -1,
     });
     this.slots[slot] = entity;
+    if (this.anchored) this.placeCardInSlot(entity, slot);
   }
 
   private buildBin(): void {
@@ -386,7 +394,7 @@ export class TriageSystem extends createSystem({
 
   private onGrab(entity: Entity): void {
     const rt = this.runtime.get(entity);
-    if (!rt) return;
+    if (!rt || rt.dismissT >= 0) return;
     entity.setValue(EmailCard, 'state', CardState.Held);
     // Swap to the expanded texture + grow, so the full body is readable.
     rt.mat.map = rt.expandedTex;
@@ -399,7 +407,7 @@ export class TriageSystem extends createSystem({
 
   private onRelease(entity: Entity): void {
     const rt = this.runtime.get(entity);
-    if (!rt) return;
+    if (!rt || rt.dismissT >= 0) return;
     // Restore compact look first; dismiss handlers re-hide below.
     rt.mat.map = rt.faceTex;
     rt.mat.needsUpdate = true;
@@ -434,6 +442,9 @@ export class TriageSystem extends createSystem({
   }
 
   private beginDismiss(entity: Entity, rt: CardRuntime): void {
+    if (rt.dismissT >= 0) return;
+    // Inherited by the visual child: the fading card is no longer a target.
+    rt.root.pointerEvents = 'none';
     entity.setValue(EmailCard, 'state', CardState.Dismissed);
     rt.dismissT = 0;
     const slot = entity.getValue(EmailCard, 'slotIndex') ?? -1;
@@ -442,6 +453,17 @@ export class TriageSystem extends createSystem({
     entity.setValue(EmailCard, 'slotIndex', -1);
     this.remaining = Math.max(0, this.remaining - 1);
     this.drawHud();
+  }
+
+  private disposeCardTextures(entity: Entity): void {
+    const rt = this.runtime.get(entity);
+    if (!rt) return;
+    // Entity disposal only sees the currently attached map. Own both textures
+    // here, and detach the map so SDK resource cleanup cannot dispose it twice.
+    rt.mat.map = null;
+    rt.faceTex.dispose();
+    rt.expandedTex.dispose();
+    this.runtime.delete(entity);
   }
 
   private hideHint(): void {
@@ -525,7 +547,7 @@ export class TriageSystem extends createSystem({
       if (state === CardState.Returning) {
         const home = entity.getVectorView(EmailCard, 'homePosition');
         this.tmpA.set(home[0], home[1], home[2]);
-        const mesh = rt.mesh;
+        const mesh = rt.root;
         mesh.position.lerp(this.tmpA, Math.min(1, RETURN_LERP * delta));
         if (mesh.position.distanceToSquared(this.tmpA) < 1e-6) {
           mesh.position.copy(this.tmpA);
@@ -533,7 +555,7 @@ export class TriageSystem extends createSystem({
         }
       } else if (state === CardState.Dismissed && rt.dismissT >= 0) {
         rt.dismissT += delta;
-        rt.mesh.position.addScaledVector(rt.dismissVel, delta);
+        rt.root.position.addScaledVector(rt.dismissVel, delta);
         rt.mat.opacity = Math.max(
           0,
           1 - rt.dismissT / DISMISS_DURATION,
