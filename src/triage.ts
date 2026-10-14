@@ -7,7 +7,7 @@
  * TriageSystem — the spatial inbox-zero game loop.
  *
  * Cards (one per unread email) rest in a gentle arc in front of the player.
- * Bare-hand gestures, all via IWSDK's GrabSystem + hand tracking:
+ * Bare-hand gestures via IWSDK's GrabSystem and WebXR hand joints:
  *
  *   PINCH a card ......... grab it; the card scales up and swaps to its
  *                          expanded texture so you can read the full body.
@@ -15,14 +15,18 @@
  *   FLICK LEFT on release .  delete   (card flies left and fades)
  *   RELEASE OVER TODAY BIN  keep for today (card flies into the bin)
  *   RELEASE elsewhere .....  card lerps back to its arc slot
+ *   PINCH UNDO ........... restore the last dismissed card.
+ *   OPEN PALM + SWEEP .... spin the carousel one step (every queued card
+ *                          rotates to the adjacent slot, wrapping around).
+ *   FLICK UP / DOWN ..... reply / forward inside VR, without dismissing.
+ *   PINCH REPLY / FORWARD  alternative actions for the last selected card.
  *   PINCH the EXIT card ...  leave the immersive session (world.exitXR()).
  *                          The Quest system fallback is palm-toward-you +
  *                          pinch, wait for the icon to fill, then release.
  *
- * Flick detection: per-hand velocity is tracked every frame from the
- * grip-space world position (works for hands and controllers). On release,
- * the releasing hand's smoothed velocity classifies the gesture. Thresholds
- * are deliberately conservative — a drop is never a delete.
+ * Flick detection uses a short movement window in the player's facing frame.
+ * Small sideways flicks arm a color cue, with a brief grace period to release.
+ * UNDO restores the most recent dismissal, including after the slot refills.
  *
  * Player anchoring: fixed world coordinates are unreliable — the XR
  * reference space is not guaranteed to line up with where the user is
@@ -33,8 +37,8 @@
  * already head-following and is untouched.
  *
  * NOTE (hand tuning): these numbers were picked blind, without a headset
- * session. Expect to tune FLICK_SPEED_MPS, BIN_RADIUS_M, and the arc layout
- * on-device. Everything tunable lives in the TUNING block below.
+ * session. Expect to tune src/swipe.ts, BIN_RADIUS_M, and the arc layout
+ * on-device. Layout tuning lives in the TUNING block below.
  */
 
 import {
@@ -55,6 +59,11 @@ import {
 import type { Entity } from '@iwsdk/core';
 import { CardState, EmailCard } from './email-card.js';
 import { MOCK_INBOX } from './mockInbox.js';
+import { SwipeTracker } from './swipe.js';
+import { OpenPalmReader, PalmSwipeTracker } from './palm-swipe.js';
+import { SampleMail } from './sample-mail.js';
+import type { ComposeMode } from './sample-mail.js';
+import { ImmersiveComposer } from './immersive-composer.js';
 import {
   makeCardTextures,
   makeLabelPlane,
@@ -78,10 +87,6 @@ const CARD_H = 0.24;
 const CARD_EXPANDED_W = 0.46;
 const CARD_EXPANDED_H = 0.64;
 const HELD_SCALE = 1.3;
-/** Min horizontal hand speed (m/s) to count as a flick. */
-const FLICK_SPEED_MPS = 1.0;
-/** Flick must be this much stronger on X than on Y/Z to count. */
-const FLICK_AXIS_DOMINANCE = 1.5;
 /** TODAY bin, mirrored EXIT card: (sideways-m, y-offset-m, distance-m). */
 const BIN_X = 0.68;
 const BIN_Y_OFF = -0.3;
@@ -91,7 +96,9 @@ const BIN_RADIUS_M = 0.3;
 const EXIT_X = -0.68;
 const EXIT_Y_OFF = -0.3;
 const EXIT_DIST = 0.7;
-const HINT_Y_OFF = -0.68;
+const UNDO_Y_OFF = -0.65;
+const UNDO_DIST = 0.7;
+const HINT_Y_OFF = -1.02;
 const HINT_DIST = 0.95;
 const ZERO_Y_OFF = -0.15;
 const ZERO_DIST = 1.3;
@@ -102,6 +109,7 @@ const DISMISS_DURATION = 0.55;
 const RETURN_LERP = 7;
 /** Frames to wait after XR session start before re-anchoring (pose settle). */
 const ANCHOR_SETTLE_FRAMES = 6;
+const HANDS = ['left', 'right'] as const;
 
 interface CardRuntime {
   /** GrabSystem owns this transform; visual expansion stays on its child. */
@@ -112,10 +120,16 @@ interface CardRuntime {
   expandedTex: CanvasTexture;
   /** Hand that last held this card ('left' | 'right' | null). */
   lastHand: 'left' | 'right' | null;
+  swipe: SwipeTracker;
   dismissT: number; // < 0 = not dismissing
   dismissVel: Vector3;
   /** Arc slot freed by this dismiss (-1 = none) — refill target. */
   dismissSlot: number;
+  /**
+   * Target orientation while gliding to a new slot (carousel spin). Null
+   * for ordinary returns, which keep their slot and facing.
+   */
+  returnQuat: Quaternion | null;
 }
 
 export class TriageSystem extends createSystem({
@@ -130,6 +144,8 @@ export class TriageSystem extends createSystem({
   private fwd = new Vector3();
   private headPos = new Vector3();
   private up = new Vector3(0, 1, 0);
+  /** Scratch object for lookAt-based slot orientation (never added to scene). */
+  private tmpObj = new Group();
 
   // --- player anchor (position + yaw snapshot) ---
   private anchorPos = new Vector3();
@@ -138,13 +154,8 @@ export class TriageSystem extends createSystem({
   private hadSession = false;
   private settleFrames = 0;
 
-  // --- per-hand velocity tracking ---
-  private handPrevL = new Vector3();
-  private handPrevR = new Vector3();
-  private handVelL = new Vector3();
-  private handVelR = new Vector3();
-  private handInitL = false;
-  private handInitR = false;
+  private elapsed = 0;
+  private lastAction: { emailIndex: number; slot: number; entity: Entity | null } | null = null;
 
   private grab: GrabSystem | undefined;
   private runtime = new WeakMap<Entity, CardRuntime>();
@@ -153,6 +164,11 @@ export class TriageSystem extends createSystem({
   /** Slot occupancy: slot index -> entity (or null). */
   private slots: (Entity | null)[] = [];
   private remaining = 0;
+  private palmHands = HANDS.map((hand) => ({
+    hand, reader: new OpenPalmReader(), swipe: new PalmSwipeTracker(),
+    source: undefined as XRInputSource | undefined,
+  }));
+  private palmCooldownUntil = 0;
 
   // --- world-anchored props ---
   private binMesh!: Mesh;
@@ -160,6 +176,20 @@ export class TriageSystem extends createSystem({
   private binPos = new Vector3();
   private exitMesh!: Mesh;
   private exitEntity: Entity | null = null;
+
+  private undoMesh!: Mesh;
+  private undoEntity: Entity | null = null;
+  readonly mail = new SampleMail(MOCK_INBOX);
+  private composer!: ImmersiveComposer;
+  private draftWasOpen = false;
+  private composeFeedbackUntil = -1;
+  private replyMesh!: Mesh;
+  private forwardMesh!: Mesh;
+  private replyEntity: Entity | null = null;
+  private forwardEntity: Entity | null = null;
+  private selectionMesh!: Mesh;
+  private selectionCanvas!: HTMLCanvasElement;
+  private selectionTex!: CanvasTexture;
 
   // --- HUD / overlays ---
   private hudCanvas!: HTMLCanvasElement;
@@ -188,15 +218,55 @@ export class TriageSystem extends createSystem({
     this.buildHint();
     this.buildZeroOverlay();
     this.buildExit();
+    this.buildUndo();
+    this.buildComposeActions();
+    this.composer = new ImmersiveComposer(this.world, this.mail);
+    const stopVoice = () => this.composer.editor.voice.abort();
+    const sessionEnd = () => { stopVoice(); this.composer.setXR(false); };
+    this.xrManager.addEventListener('sessionend', sessionEnd);
+    const visibility = () => {
+      if (this.world.xrSession?.visibilityState !== 'visible') stopVoice();
+    };
+    let watchedSession: XRSession | undefined;
+    const watchSession = () => {
+      watchedSession?.removeEventListener('visibilitychange', visibility);
+      watchedSession = this.world.xrSession;
+      watchedSession?.addEventListener('visibilitychange', visibility);
+    };
+    this.xrManager.addEventListener('sessionstart', watchSession);
+    watchSession();
+    const pageHidden = () => {
+      if (document.visibilityState === 'hidden') { stopVoice(); this.composer.keyboard.close(); }
+    };
+    const pageGone = () => { stopVoice(); this.composer.keyboard.close(); };
+    document.addEventListener?.('visibilitychange', pageHidden);
+    globalThis.addEventListener?.('pagehide', pageGone);
+    this.cleanupFuncs.push(() => {
+      document.removeEventListener?.('visibilitychange', pageHidden);
+      globalThis.removeEventListener?.('pagehide', pageGone);
+      this.xrManager.removeEventListener('sessionend', sessionEnd);
+      this.xrManager.removeEventListener('sessionstart', watchSession);
+      watchedSession?.removeEventListener('visibilitychange', visibility);
+      this.composer.dispose();
+    });
 
     // Deal the opening hand (positioned on first anchor).
     for (let s = 0; s < SLOT_COUNT; s++) this.dealIntoSlot(s);
     this.drawHud();
 
     this.queries.grabbed.subscribe('qualify', (e) => {
+      if (this.composer.activate(e)) return;
       if (e === this.exitEntity) {
         // Pinch the EXIT card → leave the immersive session, back to the page.
         this.world.exitXR();
+        return;
+      }
+      if (e === this.undoEntity) {
+        this.undoLastAction();
+        return;
+      }
+      if (e === this.replyEntity || e === this.forwardEntity) {
+        this.composeSelection(e === this.replyEntity ? 'reply' : 'forward');
         return;
       }
       this.onGrab(e);
@@ -246,6 +316,12 @@ export class TriageSystem extends createSystem({
     this.placeLocal(this.zeroMesh, 0, ZERO_Y_OFF, ZERO_DIST, true);
     this.placeLocal(this.exitMesh, EXIT_X, EXIT_Y_OFF, EXIT_DIST, true);
 
+    this.placeLocal(this.undoMesh, 0, UNDO_Y_OFF, UNDO_DIST, true);
+    this.placeLocal(this.replyMesh, -0.43, UNDO_Y_OFF, UNDO_DIST, true);
+    this.placeLocal(this.forwardMesh, 0.43, UNDO_Y_OFF, UNDO_DIST, true);
+    this.placeLocal(this.selectionMesh, 0, -0.82, 0.9, true);
+    if (this.mail.draft) this.composer.reanchor();
+
     this.anchored = true;
   }
 
@@ -266,28 +342,64 @@ export class TriageSystem extends createSystem({
     }
   }
 
-  private placeCardInSlot(entity: Entity, slot: number): void {
-    const rt = this.runtime.get(entity);
-    if (!rt) return;
+  /** World pose (position + player-facing orientation) of an arc slot. */
+  private slotPose(slot: number, outPos: Vector3, outQuat: Quaternion): void {
     const t = SLOT_COUNT === 1 ? 0 : slot / (SLOT_COUNT - 1); // 0..1
     const x = (t - 0.5) * 2 * SLOT_SPREAD;
     const dist = SLOT_DIST + 0.15 * Math.pow(x / SLOT_SPREAD, 2); // gentle arc
-    this.tmpB.set(x, 0, -dist).applyQuaternion(this.anchorYawQ);
-    this.tmpB.add(this.anchorPos);
-    this.tmpB.y = this.anchorPos.y + SLOT_Y_OFF;
-    rt.root.position.copy(this.tmpB);
+    outPos.set(x, 0, -dist).applyQuaternion(this.anchorYawQ);
+    outPos.add(this.anchorPos);
+    outPos.y = this.anchorPos.y + SLOT_Y_OFF;
     // Face the player (plane +Z toward the head).
-    rt.root.lookAt(this.anchorPos.x, this.tmpB.y, this.anchorPos.z);
+    this.tmpObj.position.copy(outPos);
+    this.tmpObj.lookAt(this.anchorPos.x, outPos.y, this.anchorPos.z);
+    outQuat.copy(this.tmpObj.quaternion);
+  }
+
+  private placeCardInSlot(entity: Entity, slot: number): void {
+    const rt = this.runtime.get(entity);
+    if (!rt) return;
+    this.slotPose(slot, this.tmpB, this.tmpQ);
+    rt.root.position.copy(this.tmpB);
+    rt.root.quaternion.copy(this.tmpQ);
     const home = entity.getVectorView(EmailCard, 'homePosition');
     home[0] = this.tmpB.x;
     home[1] = this.tmpB.y;
     home[2] = this.tmpB.z;
   }
 
+  /**
+   * Rotate every queued card one slot in the swipe direction, wrapping around
+   * the arc. Cards glide to their new slots via the Returning state; inbox
+   * membership, slot refill and undo history are untouched — a palm spin only
+   * rearranges.
+   */
+  private spinCarousel(direction: 1 | -1): void {
+    const moves: { entity: Entity; slot: number }[] = [];
+    for (let s = 0; s < SLOT_COUNT; s++) {
+      const entity = this.slots[s];
+      if (!entity || entity.getValue(EmailCard, 'state') !== CardState.Queued) continue;
+      moves.push({ entity, slot: (s + direction + SLOT_COUNT) % SLOT_COUNT });
+    }
+    if (moves.length === 0) return;
+    for (const { entity, slot } of moves) {
+      const rt = this.runtime.get(entity);
+      if (!rt) continue;
+      this.slotPose(slot, this.tmpB, this.tmpQ);
+      const home = entity.getVectorView(EmailCard, 'homePosition');
+      home[0] = this.tmpB.x;
+      home[1] = this.tmpB.y;
+      home[2] = this.tmpB.z;
+      rt.returnQuat = new Quaternion().copy(this.tmpQ);
+      entity.setValue(EmailCard, 'slotIndex', slot);
+      entity.setValue(EmailCard, 'state', CardState.Returning);
+      this.slots[slot] = entity;
+    }
+  }
+
   // ------------------------------------------------------------------ setup
 
-  private dealIntoSlot(slot: number): void {
-    const emailIndex = this.queue.shift();
+  private dealIntoSlot(slot: number, emailIndex = this.queue.shift()): void {
     if (emailIndex === undefined) return;
     const email = MOCK_INBOX[emailIndex];
     const { face, expanded } = makeCardTextures(email);
@@ -312,9 +424,11 @@ export class TriageSystem extends createSystem({
       faceTex: face,
       expandedTex: expanded,
       lastHand: null,
+      swipe: new SwipeTracker(),
       dismissT: -1,
       dismissVel: new Vector3(),
       dismissSlot: -1,
+      returnQuat: null,
     });
     this.slots[slot] = entity;
     if (this.anchored) this.placeCardInSlot(entity, slot);
@@ -349,6 +463,63 @@ export class TriageSystem extends createSystem({
     this.exitMesh.pointerEventsType = { allow: ['grab', 'ray'] };
   }
 
+  private buildUndo(): void {
+    this.undoMesh = makeLabelPlane('UNDO', 0.36, {
+      fontPx: 96,
+      color: '#aaccff',
+      sub: 'pinch to restore',
+    });
+    this.undoEntity = this.world.createTransformEntity(this.undoMesh);
+    this.undoEntity.addComponent(OneHandGrabbable, { rotate: false, translate: false });
+    this.undoEntity.addComponent(RayInteractable);
+    this.undoMesh.pointerEventsType = { allow: ['grab', 'ray'] };
+    this.updateUndoState();
+  }
+
+  private canUndo(): boolean {
+    if (!this.lastAction || this.mail.draft) return false;
+    for (const entity of this.queries.cards.entities) {
+      if (entity.getValue(EmailCard, 'state') === CardState.Held) return false;
+    }
+    return true;
+  }
+
+  private updateUndoState(): void {
+    const enabled = this.canUndo();
+    (this.undoMesh.material as MeshBasicMaterial).opacity = enabled ? 1 : 0.3;
+    this.undoMesh.pointerEvents = enabled ? 'auto' : 'none';
+  }
+
+  private undoLastAction(): void {
+    if (!this.canUndo()) return;
+    const action = this.lastAction!;
+    this.lastAction = null;
+    const rt = action.entity ? this.runtime.get(action.entity) : undefined;
+    if (rt && action.entity) {
+      rt.dismissT = -1;
+      rt.dismissSlot = -1;
+      rt.root.pointerEvents = 'auto';
+      rt.mat.opacity = 1;
+      action.entity.setValue(EmailCard, 'state', CardState.Queued);
+      action.entity.setValue(EmailCard, 'slotIndex', action.slot);
+      this.slots[action.slot] = action.entity;
+      this.placeCardInSlot(action.entity, action.slot);
+    } else {
+      const replacement = this.slots[action.slot];
+      if (replacement) {
+        this.queue.unshift(replacement.getValue(EmailCard, 'emailIndex')!);
+        replacement.dispose();
+      }
+      this.dealIntoSlot(action.slot, action.emailIndex);
+    }
+    this.remaining++;
+    this.mail.setAvailable(MOCK_INBOX[action.emailIndex].id, true);
+    this.zeroT = -1;
+    this.zeroMesh.visible = false;
+    this.drawHud();
+    this.updateUndoState();
+  }
+
   private buildHud(): void {
     this.hudCanvas = document.createElement('canvas');
     this.hudCanvas.width = 512;
@@ -357,6 +528,75 @@ export class TriageSystem extends createSystem({
     this.hudTex = new CanvasTexture(this.hudCanvas);
     this.hudMesh = makeTexturedPlane(0.55, 0.1375, this.hudTex);
     this.world.createTransformEntity(this.hudMesh);
+  }
+
+  private buildComposeActions(): void {
+    const action = (label: string): [Mesh, Entity] => {
+      const mesh = makeLabelPlane(label, 0.36, {
+        fontPx: 90, color: '#aaccff', sub: label === 'REPLY' ? 'or flick a card up' : 'or flick a card down',
+      });
+      const entity = this.world.createTransformEntity(mesh);
+      entity.addComponent(OneHandGrabbable, { rotate: false, translate: false });
+      entity.addComponent(RayInteractable);
+      mesh.pointerEventsType = { allow: ['grab', 'ray'] };
+      return [mesh, entity];
+    };
+    [this.replyMesh, this.replyEntity] = action('REPLY');
+    [this.forwardMesh, this.forwardEntity] = action('FORWARD');
+    this.selectionCanvas = document.createElement('canvas');
+    this.selectionCanvas.width = 1024;
+    this.selectionCanvas.height = 160;
+    this.selectionTex = new CanvasTexture(this.selectionCanvas);
+    this.selectionMesh = makeTexturedPlane(1.05, 1.05 * 160 / 1024, this.selectionTex);
+    this.selectionMesh.pointerEvents = 'none';
+    this.world.createTransformEntity(this.selectionMesh);
+    this.cleanupFuncs.push(this.mail.subscribe(() => {
+      const open = !!this.mail.draft;
+      if (this.draftWasOpen && !open) this.composeFeedbackUntil = this.elapsed + 8;
+      this.draftWasOpen = open;
+      this.drawSelection();
+      this.updateComposeActions();
+    }));
+    this.drawSelection();
+    this.updateComposeActions();
+  }
+
+  private drawSelection(): void {
+    const ctx = this.selectionCanvas.getContext('2d')!;
+    ctx.clearRect(0, 0, 1024, 160);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#cfe0ff';
+    ctx.font = '600 40px system-ui, sans-serif';
+    const selected = this.mail.selected;
+    const feedback = this.elapsed < this.composeFeedbackUntil;
+    ctx.fillText(feedback ? this.mail.status : selected ? `Selected: ${selected.sender}` : 'Flick ↑ reply / ↓ forward / → archive / ← delete', 512, 58, 1000);
+    ctx.font = '400 34px system-ui, sans-serif';
+    ctx.fillText(feedback ? 'Sample only • no email delivery' : selected ? selected.subject : 'Pinch, flick, release • TODAY keeps', 512, 112, 1000);
+    this.selectionTex.needsUpdate = true;
+  }
+
+  private canCompose(): boolean {
+    if (!this.mail.selected || this.mail.draft) return false;
+    for (const entity of this.queries.cards.entities) {
+      if (entity.getValue(EmailCard, 'state') === CardState.Held) return false;
+    }
+    return true;
+  }
+
+  private updateComposeActions(): void {
+    const enabled = this.canCompose();
+    for (const mesh of [this.replyMesh, this.forwardMesh]) {
+      (mesh.material as MeshBasicMaterial).opacity = enabled ? 1 : 0.3;
+      mesh.pointerEvents = enabled ? 'auto' : 'none';
+    }
+  }
+
+  /** XR stays active; no browser-form or custom-keyboard compose path. */
+  composeSelection(mode: ComposeMode): boolean {
+    if (!this.world.xrSession) return false;
+    if (!this.canCompose() || !this.mail.begin(mode)) return false;
+    this.composer.setXR(!!this.world.xrSession);
+    return true;
   }
 
   private drawHud(): void {
@@ -378,10 +618,10 @@ export class TriageSystem extends createSystem({
   }
 
   private buildHint(): void {
-    this.hintMesh = makeLabelPlane('Touch or aim, then pinch', 1.15, {
+    this.hintMesh = makeLabelPlane('Open palm, hold, sweep ← → to spin', 1.15, {
       fontPx: 56,
       color: '#cfe0ff',
-      sub: 'flick → archive · ← flick delete · drop in TODAY to keep',
+      sub: '↑ reply · ↓ forward · → archive · ← delete · TODAY keeps',
     });
     this.world.createTransformEntity(this.hintMesh);
   }
@@ -398,10 +638,43 @@ export class TriageSystem extends createSystem({
 
   // ------------------------------------------------------------- gestures
 
+  private updatePalmSwipes(): void {
+    const session = this.world.xrSession;
+    const enabled = session && session.visibilityState === 'visible' && !this.mail.draft && this.settleFrames === 0;
+    // Pinches (including buttons) own input until their grab has ended.
+    const holding = this.queries.grabbed.entities.size > 0;
+    const frame = enabled && !holding ? this.world.xrFrame : null;
+    const space = frame ? this.world.xrReferenceSpace : null;
+    for (const state of this.palmHands) {
+      const source = this.input.xr.getPrimaryInputSource(state.hand);
+      if (source !== state.source) { state.swipe.reset(); state.source = source; continue; }
+      if (!frame || !space || !source?.hand || !state.reader.read(frame, space, source.hand)) {
+        state.swipe.reset();
+        continue;
+      }
+      // The gesture is global: an open palm anywhere spins the carousel, so
+      // there is no card targeting and no highlight color to maintain.
+      if (this.elapsed < this.palmCooldownUntil) continue;
+      this.player.localToWorld(state.reader.position);
+      this.player.head.getWorldQuaternion(this.tmpQ);
+      this.fwd.set(0, 0, -1).applyQuaternion(this.tmpQ);
+      this.tmpQ.setFromAxisAngle(this.up, Math.atan2(-this.fwd.x, -this.fwd.z));
+      const direction = state.swipe.add(state.reader.position, this.tmpQ, this.elapsed);
+      if (!direction) continue;
+      this.spinCarousel(direction);
+      this.hideHint();
+      this.palmCooldownUntil = this.elapsed + .7;
+      for (const other of this.palmHands) other.swipe.reset();
+      break;
+    }
+  }
+
   private onGrab(entity: Entity): void {
     const rt = this.runtime.get(entity);
-    if (!rt || rt.dismissT >= 0) return;
+    if (!rt || rt.dismissT >= 0 || this.mail.draft) return;
+    rt.lastHand = null; // Start a fresh movement window for every grab.
     entity.setValue(EmailCard, 'state', CardState.Held);
+    this.mail.select(MOCK_INBOX[entity.getValue(EmailCard, 'emailIndex')!].id);
     // Swap to the expanded texture + grow, so the full body is readable.
     rt.mat.map = rt.expandedTex;
     rt.mat.needsUpdate = true;
@@ -419,26 +692,24 @@ export class TriageSystem extends createSystem({
     rt.mat.needsUpdate = true;
     rt.mesh.scale.setScalar(1);
 
-    const hand = rt.lastHand;
-    const vel = hand === 'left' ? this.handVelL : this.handVelR;
-    const ax = Math.abs(vel.x);
-
+    rt.mat.color.setHex(0xffffff);
+    const dir = rt.lastHand ? rt.swipe.getDirection(this.elapsed) : 0;
+    const flick = rt.lastHand ? rt.swipe.getFlick(this.elapsed) : null;
     entity.object3D?.getWorldPosition(this.tmpA);
 
-    if (
-      hand !== null &&
-      ax > FLICK_SPEED_MPS &&
-      ax > FLICK_AXIS_DOMINANCE * Math.abs(vel.y) &&
-      ax > FLICK_AXIS_DOMINANCE * Math.abs(vel.z)
-    ) {
-      // --- FLICK: horizontal throw classifies the triage action ---
-      const dir = vel.x > 0 ? 1 : -1; // +x = right = archive
-      rt.dismissVel.set(dir * DISMISS_SPEED, 0.7, -0.4);
+    if (this.mail.draft) {
+      entity.setValue(EmailCard, 'state', CardState.Returning);
+    } else if (this.tmpA.distanceTo(this.binPos) < BIN_RADIUS_M) {
+      // An intentional drop into TODAY takes precedence over sideways motion.
+      rt.dismissVel.copy(this.tmpB.copy(this.binPos).sub(this.tmpA).normalize());
       this.beginDismiss(entity, rt);
       this.hideHint();
-    } else if (this.tmpA.distanceTo(this.binPos) < BIN_RADIUS_M) {
-      // --- BIN: released over TODAY → keep for today ---
-      rt.dismissVel.copy(this.tmpB.copy(this.binPos).sub(this.tmpA).normalize());
+    } else if (flick === 'up' || flick === 'down') {
+      entity.setValue(EmailCard, 'state', CardState.Returning);
+      this.mail.select(MOCK_INBOX[entity.getValue(EmailCard, 'emailIndex')!].id);
+      this.composeSelection(flick === 'up' ? 'reply' : 'forward');
+    } else if (dir) {
+      rt.dismissVel.set(dir * DISMISS_SPEED, 0.7, -0.4).applyQuaternion(rt.swipe.yaw);
       this.beginDismiss(entity, rt);
       this.hideHint();
     } else {
@@ -457,8 +728,11 @@ export class TriageSystem extends createSystem({
     rt.dismissSlot = slot;
     if (slot >= 0 && slot < SLOT_COUNT) this.slots[slot] = null;
     entity.setValue(EmailCard, 'slotIndex', -1);
+    this.lastAction = { emailIndex: entity.getValue(EmailCard, 'emailIndex')!, slot, entity };
+    this.mail.setAvailable(MOCK_INBOX[this.lastAction.emailIndex].id, false);
     this.remaining = Math.max(0, this.remaining - 1);
     this.drawHud();
+    this.updateUndoState();
   }
 
   private disposeCardTextures(entity: Entity): void {
@@ -470,6 +744,9 @@ export class TriageSystem extends createSystem({
     rt.faceTex.dispose();
     rt.expandedTex.dispose();
     this.runtime.delete(entity);
+    const slot = this.slots.indexOf(entity);
+    if (slot >= 0) this.slots[slot] = null;
+    if (this.lastAction?.entity === entity) this.lastAction.entity = null;
   }
 
   private hideHint(): void {
@@ -480,28 +757,6 @@ export class TriageSystem extends createSystem({
   }
 
   // ---------------------------------------------------------------- update
-
-  private trackHand(hand: 'left' | 'right', delta: number): void {
-    const space = this.player.gripSpaces[hand];
-    if (!space) return;
-    space.getWorldPosition(this.tmpA);
-    const prev = hand === 'left' ? this.handPrevL : this.handPrevR;
-    const vel = hand === 'left' ? this.handVelL : this.handVelR;
-    const init = hand === 'left' ? this.handInitL : this.handInitR;
-    if (!init) {
-      prev.copy(this.tmpA);
-      vel.set(0, 0, 0);
-      if (hand === 'left') this.handInitL = true;
-      else this.handInitR = true;
-      return;
-    }
-    if (delta > 0) {
-      // Instantaneous velocity, then exponential smoothing to kill jitter.
-      this.tmpB.copy(this.tmpA).sub(prev).divideScalar(delta);
-      vel.lerp(this.tmpB, 0.4);
-    }
-    prev.copy(this.tmpA);
-  }
 
   private updateHudPose(): void {
     this.player.head.getWorldPosition(this.headPos);
@@ -515,6 +770,7 @@ export class TriageSystem extends createSystem({
 
   update(delta: number): void {
     if (delta <= 0) return;
+    this.elapsed += delta;
 
     // 0. Anchor the layout to the player: once on the first frame, and again
     //    shortly after an XR session starts (head pose needs a few frames
@@ -530,19 +786,50 @@ export class TriageSystem extends createSystem({
       if (this.settleFrames === 0) this.anchorToPlayer();
     }
     this.hadSession = hasSession;
+    this.composer.setXR(hasSession);
+    const composing = !!this.mail.draft;
+    // Keep the original in the composer; suspend background card targeting.
+    for (const entity of this.queries.cards.entities) {
+      const rt = this.runtime.get(entity);
+      if (!rt) continue;
+      rt.root.visible = !composing;
+      rt.root.pointerEvents = composing || rt.dismissT >= 0 ? 'none' : 'auto';
+    }
+    for (const mesh of [this.binMesh, this.binLabel, this.undoMesh, this.replyMesh, this.forwardMesh, this.selectionMesh, this.hudMesh, this.exitMesh]) {
+      mesh.visible = !composing;
+    }
+    this.hintMesh.visible = !composing && !this.hintHidden;
+    if (composing) this.zeroMesh.visible = false;
+    if (this.composeFeedbackUntil >= 0 && this.elapsed >= this.composeFeedbackUntil) {
+      this.composeFeedbackUntil = -1;
+      this.drawSelection();
+    }
 
-    // 1. Hand velocity, both hands, every frame (needed at release time).
-    this.trackHand('left', delta);
-    this.trackHand('right', delta);
-
-    // 2. Remember which hand holds each grabbed card (getHolderHand is only
-    //    valid while grabbed — after release it returns null).
+    // Track only held cards, measuring sideways relative to facing at grab.
     if (this.grab) {
       for (const entity of this.queries.grabbed.entities) {
         const rt = this.runtime.get(entity);
-        if (rt) rt.lastHand = this.grab.getHolderHand(entity);
+        if (!rt || rt.dismissT >= 0) continue;
+        const hand = this.grab.getHolderHand(entity);
+        if (!hand) continue;
+        this.player.gripSpaces[hand].getWorldPosition(this.tmpA);
+        if (rt.lastHand !== hand) {
+          this.player.head.getWorldQuaternion(this.tmpQ);
+          this.fwd.set(0, 0, -1).applyQuaternion(this.tmpQ);
+          this.tmpQ.setFromAxisAngle(this.up, Math.atan2(-this.fwd.x, -this.fwd.z));
+          rt.swipe.reset(this.tmpA, this.tmpQ, this.elapsed);
+          rt.lastHand = hand;
+        } else {
+          rt.swipe.add(this.tmpA, this.elapsed);
+        }
+        const flick = rt.swipe.getFlick(this.elapsed);
+        rt.mat.color.setHex(flick === 'right' ? 0xaaffcc : flick === 'left' ? 0xffaaaa : flick === 'up' ? 0xaacfff : flick === 'down' ? 0xe3b0ff : 0xffffff);
       }
     }
+    this.updateUndoState();
+
+    this.updatePalmSwipes();
+    this.updateComposeActions();
 
     // 3. Card state machines.
     for (const entity of this.queries.cards.entities) {
@@ -554,9 +841,16 @@ export class TriageSystem extends createSystem({
         const home = entity.getVectorView(EmailCard, 'homePosition');
         this.tmpA.set(home[0], home[1], home[2]);
         const mesh = rt.root;
-        mesh.position.lerp(this.tmpA, Math.min(1, RETURN_LERP * delta));
+        const k = Math.min(1, RETURN_LERP * delta);
+        mesh.position.lerp(this.tmpA, k);
+        // Carousel spins also rotate the card to face the player from its new slot.
+        if (rt.returnQuat) mesh.quaternion.slerp(rt.returnQuat, k);
         if (mesh.position.distanceToSquared(this.tmpA) < 1e-6) {
           mesh.position.copy(this.tmpA);
+          if (rt.returnQuat) {
+            mesh.quaternion.copy(rt.returnQuat);
+            rt.returnQuat = null;
+          }
           entity.setValue(EmailCard, 'state', CardState.Queued);
         }
       } else if (state === CardState.Dismissed && rt.dismissT >= 0) {
