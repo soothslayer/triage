@@ -14,6 +14,8 @@
 export interface Email {
   id: string;
   sender: string;
+  /** Fictional address used only by the sample composer. */
+  senderAddress: string;
   subject: string;
   /** 2–3 line preview shown on the card face. */
   preview: string;
@@ -27,6 +29,7 @@ export interface Email {
 export const MOCK_INBOX: Email[] = [
   {
     id: 'm1',
+    senderAddress: 'sara@family.example',
     sender: 'Sara Miller',
     subject: 'Re: Camden’s birthday — Saturday headcount',
     preview:
@@ -37,6 +40,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm2',
+    senderAddress: 'glenn@plandynamic.example',
     sender: 'Glenn Brown, PlanDynamic',
     subject: 'Your financial plan draft is ready to review',
     preview:
@@ -47,6 +51,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm3',
+    senderAddress: 'notifications@github.example',
     sender: 'GitHub',
     subject: '[soothslayer/call-me] PR #1 approved',
     preview:
@@ -57,6 +62,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm4',
+    senderAddress: 'travel@southwest.example',
     sender: 'Southwest Airlines',
     subject: 'Your trip is in 73 days — check in soon',
     preview:
@@ -67,6 +73,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm5',
+    senderAddress: 'updates@linkedin.example',
     sender: 'LinkedIn',
     subject: 'You appeared in 12 searches this week',
     preview:
@@ -77,6 +84,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm6',
+    senderAddress: 'orders@bambu.example',
     sender: 'Bambu Lab',
     subject: 'Your order has shipped',
     preview:
@@ -87,6 +95,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm7',
+    senderAddress: 'coach@soccer.example',
     sender: 'Coach Tremble',
     subject: 'Saturday soccer — field change',
     preview:
@@ -97,6 +106,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm8',
+    senderAddress: 'plans@bestbuy.example',
     sender: 'Best Buy',
     subject: 'Your Geek Squad protection plan renews soon',
     preview:
@@ -107,6 +117,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm9',
+    senderAddress: 'no-reply@deals.example',
     sender: 'no-reply@deals.example',
     subject: 'FLASH SALE: 70% off extended 2 hours!!',
     preview:
@@ -117,6 +128,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm10',
+    senderAddress: 'vrstart@meta.example',
     sender: 'Meta VR Start',
     subject: 'Submission checklist — 39 days left',
     preview:
@@ -127,6 +139,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm11',
+    senderAddress: 'pto@school.example',
     sender: 'Stapleton Elementary PTO',
     subject: 'Fall Festival volunteers — thank you!',
     preview:
@@ -137,6 +150,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm12',
+    senderAddress: 'statements@chase.example',
     sender: 'Chase',
     subject: 'Your statement is ready',
     preview:
@@ -147,6 +161,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm13',
+    senderAddress: 'trades@fidelity.example',
     sender: 'Fidelity',
     subject: 'Trade confirmation: VTI buy order filled',
     preview:
@@ -157,6 +172,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm14',
+    senderAddress: 'mom@family.example',
     sender: 'Mom',
     subject: 'That lawyer letter',
     preview:
@@ -167,6 +183,7 @@ export const MOCK_INBOX: Email[] = [
   },
   {
     id: 'm15',
+    senderAddress: 'offers@oldnavy.example',
     sender: 'Old Navy',
     subject: 'We miss you! 40% off inside',
     preview:
