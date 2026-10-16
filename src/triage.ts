@@ -16,11 +16,11 @@
  *   RELEASE OVER TODAY BIN  keep for today (card flies into the bin)
  *   RELEASE elsewhere .....  card lerps back to its arc slot
  *   PINCH UNDO ........... restore the last dismissed card.
- *   OPEN PALM + SWEEP .... spin the carousel one step (every queued card
- *                          rotates to the adjacent slot, wrapping around).
  *   FLICK UP / DOWN ..... reply / forward inside VR, without dismissing.
  *   PINCH REPLY / FORWARD  alternative actions for the last selected card.
- *   PINCH the EXIT card ...  leave the immersive session (world.exitXR()).
+ *   PALM MENU ............ turn either open palm toward your face and hold:
+ *                          a menu appears with EXIT (leave VR), UNDO
+ *                          (restore last dismissal), and HELP (how to play).
  *                          The Quest system fallback is palm-toward-you +
  *                          pinch, wait for the icon to fill, then release.
  *
@@ -31,7 +31,7 @@
  * Player anchoring: fixed world coordinates are unreliable — the XR
  * reference space is not guaranteed to line up with where the user is
  * standing/facing when the session starts. So the whole layout (card arc,
- * TODAY bin, hint, EXIT card) anchors to the head pose: once on the first
+ * TODAY bin, hint, palm menu) anchors to the head pose: once on the first
  * frame (covers the flat/emulator preview) and again a few frames after an
  * XR session starts (covers entering VR from the 2D page). The HUD was
  * already head-following and is untouched.
@@ -61,6 +61,7 @@ import { CardState, EmailCard } from './email-card.js';
 import { MOCK_INBOX } from './mockInbox.js';
 import { SwipeTracker } from './swipe.js';
 import { OpenPalmReader, PalmSwipeTracker } from './palm-swipe.js';
+import { PalmFacingReader } from './palm-menu.js';
 import { SampleMail } from './sample-mail.js';
 import type { ComposeMode } from './sample-mail.js';
 import { ImmersiveComposer } from './immersive-composer.js';
@@ -87,15 +88,29 @@ const CARD_H = 0.24;
 const CARD_EXPANDED_W = 0.46;
 const CARD_EXPANDED_H = 0.64;
 const HELD_SCALE = 1.3;
-/** TODAY bin, mirrored EXIT card: (sideways-m, y-offset-m, distance-m). */
+/** TODAY bin position: (sideways-m, y-offset-m, distance-m). */
 const BIN_X = 0.68;
 const BIN_Y_OFF = -0.3;
 const BIN_DIST = 0.7;
 /** Release within this radius (m) of the bin center = keep for today. */
 const BIN_RADIUS_M = 0.3;
-const EXIT_X = -0.68;
-const EXIT_Y_OFF = -0.3;
-const EXIT_DIST = 0.7;
+/** Palm menu layout: (y-offset-m, distance-m); buttons at +/- MENU_SPREAD. */
+const MENU_Y_OFF = -0.46;
+const MENU_DIST = 0.8;
+const MENU_SPREAD = 0.34;
+/** Palm-facing-head dot product that starts counting a menu summon. */
+const MENU_FACE_ON = 0.65;
+/** Dot product below which the menu starts hiding. */
+const MENU_FACE_OFF = 0.35;
+/** Seconds of sustained palm-facing to show the menu. */
+const MENU_HOLD_S = 0.35;
+/** Seconds of palm-away before the menu hides. */
+const MENU_HIDE_S = 0.4;
+/** Palm must be this close to the head (m) to summon the menu. */
+const MENU_HEAD_DIST_M = 0.75;
+/** Open-palm carousel sweep: turned off 2026-10-16 in favor of the
+ *  upcoming pinch-drag carousel. Trackers kept for reference. */
+const PALM_SWIPE_ENABLED = false;
 const UNDO_Y_OFF = -0.65;
 const UNDO_DIST = 0.7;
 const HINT_Y_OFF = -1.02;
@@ -174,8 +189,15 @@ export class TriageSystem extends createSystem({
   private binMesh!: Mesh;
   private binLabel!: Mesh;
   private binPos = new Vector3();
-  private exitMesh!: Mesh;
-  private exitEntity: Entity | null = null;
+  // --- palm menu (EXIT / UNDO / HELP buttons) ---
+  private menuMeshes: Mesh[] = [];
+  private menuExitEntity: Entity | null = null;
+  private menuUndoEntity: Entity | null = null;
+  private menuHelpEntity: Entity | null = null;
+  private menuVisible = false;
+  private menuHoldT = 0;
+  private menuHideT = 0;
+  private menuReader = new PalmFacingReader();
 
   private undoMesh!: Mesh;
   private undoEntity: Entity | null = null;
@@ -217,7 +239,7 @@ export class TriageSystem extends createSystem({
     this.buildHud();
     this.buildHint();
     this.buildZeroOverlay();
-    this.buildExit();
+    this.buildPalmMenu();
     this.buildUndo();
     this.buildComposeActions();
     this.composer = new ImmersiveComposer(this.world, this.mail);
@@ -256,9 +278,19 @@ export class TriageSystem extends createSystem({
 
     this.queries.grabbed.subscribe('qualify', (e) => {
       if (this.composer.activate(e)) return;
-      if (e === this.exitEntity) {
-        // Pinch the EXIT card → leave the immersive session, back to the page.
+      if (e === this.menuExitEntity) {
+        this.hidePalmMenu();
         this.world.exitXR();
+        return;
+      }
+      if (e === this.menuUndoEntity) {
+        this.hidePalmMenu();
+        this.undoLastAction();
+        return;
+      }
+      if (e === this.menuHelpEntity) {
+        this.hidePalmMenu();
+        this.showHint();
         return;
       }
       if (e === this.undoEntity) {
@@ -314,7 +346,9 @@ export class TriageSystem extends createSystem({
     this.placeLocal(this.binLabel, BIN_X, BIN_Y_OFF + 0.32, BIN_DIST, true);
     this.placeLocal(this.hintMesh, 0, HINT_Y_OFF, HINT_DIST, true);
     this.placeLocal(this.zeroMesh, 0, ZERO_Y_OFF, ZERO_DIST, true);
-    this.placeLocal(this.exitMesh, EXIT_X, EXIT_Y_OFF, EXIT_DIST, true);
+    this.placeLocal(this.menuMeshes[0], -MENU_SPREAD, MENU_Y_OFF, MENU_DIST, true);
+    this.placeLocal(this.menuMeshes[1], 0, MENU_Y_OFF, MENU_DIST, true);
+    this.placeLocal(this.menuMeshes[2], MENU_SPREAD, MENU_Y_OFF, MENU_DIST, true);
 
     this.placeLocal(this.undoMesh, 0, UNDO_Y_OFF, UNDO_DIST, true);
     this.placeLocal(this.replyMesh, -0.43, UNDO_Y_OFF, UNDO_DIST, true);
@@ -451,16 +485,50 @@ export class TriageSystem extends createSystem({
     this.world.createTransformEntity(this.binLabel);
   }
 
-  private buildExit(): void {
-    this.exitMesh = makeLabelPlane('EXIT', 0.36, {
-      fontPx: 96,
-      color: '#ff8080',
-      sub: 'aim and pinch to leave',
-    });
-    this.exitEntity = this.world.createTransformEntity(this.exitMesh);
-    this.exitEntity.addComponent(OneHandGrabbable, { rotate: false, translate: false });
-    this.exitEntity.addComponent(RayInteractable);
-    this.exitMesh.pointerEventsType = { allow: ['grab', 'ray'] };
+  private buildPalmMenu(): void {
+    const button = (label: string, sub: string, color: string): [Mesh, Entity] => {
+      const mesh = makeLabelPlane(label, 0.3, { fontPx: 84, color, sub });
+      const entity = this.world.createTransformEntity(mesh);
+      entity.addComponent(OneHandGrabbable, { rotate: false, translate: false });
+      entity.addComponent(RayInteractable);
+      mesh.pointerEventsType = { allow: ['grab', 'ray'] };
+      mesh.visible = false;
+      mesh.pointerEvents = 'none';
+      this.menuMeshes.push(mesh);
+      return [mesh, entity];
+    };
+    [, this.menuExitEntity] = button('EXIT', 'leave VR', '#ff8080');
+    [, this.menuUndoEntity] = button('UNDO', 'restore last', '#aaccff');
+    [, this.menuHelpEntity] = button('HELP', 'how to play', '#cfe0ff');
+  }
+
+  private showPalmMenu(): void {
+    if (this.menuVisible) return;
+    this.menuVisible = true;
+    this.menuHoldT = 0;
+    this.menuHideT = 0;
+    // Mirror the persistent UNDO button's enabled state on the menu copy.
+    (this.menuMeshes[1].material as MeshBasicMaterial).opacity = this.canUndo() ? 1 : 0.35;
+    for (const mesh of this.menuMeshes) {
+      mesh.visible = true;
+      mesh.pointerEvents = 'auto';
+    }
+  }
+
+  private hidePalmMenu(): void {
+    if (!this.menuVisible) return;
+    this.menuVisible = false;
+    this.menuHoldT = 0;
+    this.menuHideT = 0;
+    for (const mesh of this.menuMeshes) {
+      mesh.visible = false;
+      mesh.pointerEvents = 'none';
+    }
+  }
+
+  private showHint(): void {
+    this.hintHidden = false;
+    this.hintMesh.visible = true;
   }
 
   private buildUndo(): void {
@@ -639,6 +707,10 @@ export class TriageSystem extends createSystem({
   // ------------------------------------------------------------- gestures
 
   private updatePalmSwipes(): void {
+    // Turned off 2026-10-16: the open-palm carousel sweep is disabled in
+    // favor of the upcoming pinch-drag carousel. Trackers kept for reference
+    // (the palm-menu summon below reuses the per-hand open-palm readers).
+    if (!PALM_SWIPE_ENABLED) return;
     const session = this.world.xrSession;
     const enabled = session && session.visibilityState === 'visible' && !this.mail.draft && this.settleFrames === 0;
     // Pinches (including buttons) own input until their grab has ended.
@@ -669,9 +741,55 @@ export class TriageSystem extends createSystem({
     }
   }
 
+  /**
+   * Palm-menu summon: either open palm turned toward the face and held
+   * still opens the EXIT / UNDO / HELP menu. Reuses the per-hand open-palm
+   * readers; facing comes from hand-joint palm normals (see palm-menu.ts).
+   * Tunables live in the MENU_* constants above.
+   */
+  private updatePalmMenu(delta: number): void {
+    const session = this.world.xrSession;
+    const enabled =
+      session && session.visibilityState === 'visible' && !this.mail.draft && this.settleFrames === 0;
+    // A grab in flight owns input: don't summon while holding, and don't
+    // hide mid-pinch either — let the pinch land first.
+    const holding = this.queries.grabbed.entities.size > 0;
+    const frame = enabled && !holding ? this.world.xrFrame : null;
+    const space = frame ? this.world.xrReferenceSpace : null;
+    this.player.head.getWorldPosition(this.headPos);
+    const toWorld = (v: Vector3): void => {
+      this.player.localToWorld(v);
+    };
+    let best = -1;
+    if (frame && space) {
+      for (const state of this.palmHands) {
+        const source = this.input.xr.getPrimaryInputSource(state.hand);
+        if (!source?.hand) continue;
+        if (!state.reader.read(frame, space, source.hand)) continue;
+        if (!this.menuReader.read(frame, space, source.hand, state.hand, toWorld, this.headPos)) continue;
+        if (this.menuReader.dist.value > MENU_HEAD_DIST_M) continue;
+        best = Math.max(best, this.menuReader.facing.value);
+      }
+    }
+    if (holding) {
+      this.menuHideT = 0;
+      return;
+    }
+    if (!this.menuVisible) {
+      if (best > MENU_FACE_ON) this.menuHoldT += delta;
+      else this.menuHoldT = 0;
+      if (this.menuHoldT >= MENU_HOLD_S) this.showPalmMenu();
+    } else {
+      if (best < MENU_FACE_OFF) this.menuHideT += delta;
+      else this.menuHideT = 0;
+      if (this.menuHideT >= MENU_HIDE_S) this.hidePalmMenu();
+    }
+  }
+
   private onGrab(entity: Entity): void {
     const rt = this.runtime.get(entity);
     if (!rt || rt.dismissT >= 0 || this.mail.draft) return;
+    this.hidePalmMenu();
     rt.lastHand = null; // Start a fresh movement window for every grab.
     entity.setValue(EmailCard, 'state', CardState.Held);
     this.mail.select(MOCK_INBOX[entity.getValue(EmailCard, 'emailIndex')!].id);
@@ -795,9 +913,14 @@ export class TriageSystem extends createSystem({
       rt.root.visible = !composing;
       rt.root.pointerEvents = composing || rt.dismissT >= 0 ? 'none' : 'auto';
     }
-    for (const mesh of [this.binMesh, this.binLabel, this.undoMesh, this.replyMesh, this.forwardMesh, this.selectionMesh, this.hudMesh, this.exitMesh]) {
+    for (const mesh of [this.binMesh, this.binLabel, this.undoMesh, this.replyMesh, this.forwardMesh, this.selectionMesh, this.hudMesh]) {
       mesh.visible = !composing;
     }
+    for (const mesh of this.menuMeshes) {
+      mesh.visible = !composing && this.menuVisible;
+      mesh.pointerEvents = !composing && this.menuVisible ? 'auto' : 'none';
+    }
+    if (composing) this.hidePalmMenu();
     this.hintMesh.visible = !composing && !this.hintHidden;
     if (composing) this.zeroMesh.visible = false;
     if (this.composeFeedbackUntil >= 0 && this.elapsed >= this.composeFeedbackUntil) {
@@ -829,6 +952,7 @@ export class TriageSystem extends createSystem({
     this.updateUndoState();
 
     this.updatePalmSwipes();
+    this.updatePalmMenu(delta);
     this.updateComposeActions();
 
     // 3. Card state machines.
