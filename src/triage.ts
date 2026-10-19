@@ -257,6 +257,18 @@ export class TriageSystem extends createSystem({
     };
     this.xrManager.addEventListener('sessionstart', watchSession);
     watchSession();
+    // --- MR mode: hide the gradient sky dome in immersive-ar so the
+    // passthrough feed shows through (the renderer clears transparent).
+    const applyArSky = () => {
+      const sessionMode = (this.world.xrSession as unknown as { mode?: string } | undefined)?.mode;
+      const inAR = sessionMode === 'immersive-ar';
+      this.world.scene.traverse((o) => {
+        if (o.userData?.iwsdkSceneDomeGradient) o.visible = !inAR;
+      });
+    };
+    this.xrManager.addEventListener('sessionstart', applyArSky);
+    this.xrManager.addEventListener('sessionend', applyArSky);
+    applyArSky();
     const pageHidden = () => {
       if (document.visibilityState === 'hidden') { stopVoice(); this.composer.keyboard.close(); }
     };
@@ -268,6 +280,8 @@ export class TriageSystem extends createSystem({
       globalThis.removeEventListener?.('pagehide', pageGone);
       this.xrManager.removeEventListener('sessionend', sessionEnd);
       this.xrManager.removeEventListener('sessionstart', watchSession);
+      this.xrManager.removeEventListener('sessionstart', applyArSky);
+      this.xrManager.removeEventListener('sessionend', applyArSky);
       watchedSession?.removeEventListener('visibilitychange', visibility);
       this.composer.dispose();
     });
